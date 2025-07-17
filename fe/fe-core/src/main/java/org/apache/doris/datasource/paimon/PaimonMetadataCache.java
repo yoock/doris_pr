@@ -46,7 +46,8 @@ public class PaimonMetadataCache {
 
     public PaimonMetadataCache(ExecutorService executor) {
         CacheFactory snapshotCacheFactory = new CacheFactory(
-                OptionalLong.of(28800L),
+                // OptionalLong.of(28800L),
+                OptionalLong.of(1L),
                 OptionalLong.of(Config.external_cache_expire_time_minutes_after_access * 60),
                 Config.max_external_table_cache_num,
                 true,

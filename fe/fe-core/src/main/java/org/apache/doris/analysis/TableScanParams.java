@@ -24,7 +24,9 @@ import java.util.List;
 import java.util.Map;
 
 public class TableScanParams {
+    public static String READ_MODE = "read_mode";
     public static String INCREMENTAL_READ = "incr";
+    public static String SNAPSHOT_READ = "snapshot";
     public static String BRANCH = "branch";
     public static String TAG = "tag";
 
@@ -57,6 +59,10 @@ public class TableScanParams {
 
     public boolean incrementalRead() {
         return INCREMENTAL_READ.equals(paramType);
+    }
+
+    public boolean snapshotRead() {
+        return SNAPSHOT_READ.equals(paramType);
     }
 
     public boolean isBranch() {

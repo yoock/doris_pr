@@ -25,7 +25,7 @@ import org.apache.doris.nereids.parser.NereidsParser;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.algebra.Sink;
-import org.apache.doris.nereids.trees.plans.commands.insert.InsertOverwriteTableCommand;
+import org.apache.doris.nereids.trees.plans.commands.insert.InsertIntoTableCommand;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 
@@ -41,17 +41,11 @@ import java.util.Set;
 /**
  * Update mv by partition
  */
-public class UpdateMvByPartitionCommand extends InsertOverwriteTableCommand {
-    private static final Logger LOG = LogManager.getLogger(UpdateMvByPartitionCommand.class);
+public class UpdateMvByInrementalCommand extends InsertIntoTableCommand {
+    private static final Logger LOG = LogManager.getLogger(UpdateMvByInrementalCommand.class);
 
-    public UpdateMvByPartitionCommand(LogicalPlan logicalQuery) {
-        super(logicalQuery, Optional.empty(), Optional.empty());
+    public UpdateMvByInrementalCommand(LogicalPlan logicalQuery) {
+        super(logicalQuery, Optional.empty(), Optional.empty(), Optional.empty());
     }
 
-    @Override
-    public boolean isForceDropPartition() {
-        // After refreshing the data in MTMV, it will be synchronized with the base table
-        // and there is no need to put it in the recycle bin
-        return true;
-    }
 }

@@ -37,6 +37,7 @@ import org.apache.doris.mtmv.MTMVPartitionInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo.MTMVPartitionType;
 import org.apache.doris.mtmv.MTMVPartitionUtil;
 import org.apache.doris.mtmv.MTMVPlanUtil;
+import org.apache.doris.mtmv.MTMVRefreshEnum;
 import org.apache.doris.mtmv.MTMVRefreshEnum.MTMVRefreshState;
 import org.apache.doris.mtmv.MTMVRefreshEnum.MTMVState;
 import org.apache.doris.mtmv.MTMVRefreshInfo;
@@ -88,8 +89,11 @@ public class MTMV extends OlapTable {
     private MTMVPartitionInfo mvPartitionInfo;
     @SerializedName("rs")
     private MTMVRefreshSnapshot refreshSnapshot;
+    @SerializedName("ir")
+    private boolean incrementalRefresh;
     // Should update after every fresh, not persist
     private MTMVCache cache;
+
 
     // For deserialization
     public MTMV() {
@@ -117,6 +121,7 @@ public class MTMV extends OlapTable {
         this.refreshSnapshot = new MTMVRefreshSnapshot();
         this.envInfo = new EnvInfo(-1L, -1L);
         mvRwLock = new ReentrantReadWriteLock(true);
+        this.incrementalRefresh = refreshInfo.getRefreshMethod() == MTMVRefreshEnum.RefreshMethod.INCREMENTAL;
     }
 
     @Override
@@ -225,7 +230,11 @@ public class MTMV extends OlapTable {
                 this.status.setRefreshState(MTMVRefreshState.FAIL);
             }
             this.jobInfo.addHistoryTask(task);
-            this.refreshSnapshot.updateSnapshots(partitionSnapshots, getPartitionNames());
+            Set<String> partitionNames = getPartitionNames();
+            if (incrementalRefresh) {
+                partitionNames.add(this.name);
+            }
+            this.refreshSnapshot.updateSnapshots(partitionSnapshots, partitionNames);
             Env.getCurrentEnv().getMtmvService()
                     .refreshComplete(this, relation, task);
         } finally {
@@ -354,6 +363,10 @@ public class MTMV extends OlapTable {
 
     public MTMVRefreshSnapshot getRefreshSnapshot() {
         return refreshSnapshot;
+    }
+
+    public boolean getIncrementalRefresh() {
+        return incrementalRefresh;
     }
 
     /**

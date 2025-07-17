@@ -25,11 +25,15 @@ import org.apache.doris.catalog.PartitionType;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.constraint.TableIdentifier;
 import org.apache.doris.datasource.mvcc.MvccUtil;
+import org.apache.doris.datasource.paimon.PaimonExternalTable;
 import org.apache.doris.mtmv.BaseTableInfo;
 import org.apache.doris.mtmv.MTMVRelatedTableIf;
 import org.apache.doris.nereids.CascadesContext;
 import org.apache.doris.nereids.memo.Group;
 import org.apache.doris.nereids.memo.StructInfoMap;
+import org.apache.doris.nereids.pattern.GeneratedPlanPatterns;
+import org.apache.doris.nereids.pattern.PatternDescriptor;
+import org.apache.doris.nereids.rules.RulePromise;
 import org.apache.doris.nereids.rules.RuleType;
 import org.apache.doris.nereids.rules.analysis.BindRelation;
 import org.apache.doris.nereids.rules.expression.ExpressionNormalization;
@@ -41,6 +45,7 @@ import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.WindowExpression;
+import org.apache.doris.nereids.trees.expressions.functions.agg.AggregateFunction;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DateTrunc;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.VarcharLiteral;
@@ -62,6 +67,7 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
 import org.apache.doris.nereids.trees.plans.visitor.DefaultPlanVisitor;
 import org.apache.doris.nereids.trees.plans.visitor.NondeterministicFunctionCollector;
 import org.apache.doris.nereids.util.ExpressionUtils;
+import org.apache.doris.nereids.util.PlanUtils;
 import org.apache.doris.qe.SessionVariable;
 
 import com.google.common.collect.HashMultimap;
@@ -71,10 +77,16 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.mergetree.compact.aggregate.FieldMaxAgg;
+import org.apache.paimon.mergetree.compact.aggregate.FieldMinAgg;
+import org.apache.paimon.mergetree.compact.aggregate.FieldSumAgg;
+import org.apache.paimon.table.Table;
 
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -87,6 +99,267 @@ import java.util.stream.Collectors;
  * The common util for materialized view
  */
 public class MaterializedViewUtils {
+    public static final String MIN = "min";
+    public static final String MAX = "max";
+    public static final String SUM = "sum";
+    public static final String COUNT = "count";
+
+    public static class PaimonMVAggInfo {
+        public List<String> keys = new ArrayList<>();
+        public Map<String, String> aggFunctions = new HashMap<>();
+    }
+
+    private static class MVAnalysis implements GeneratedPlanPatterns {
+        private static final ImmutableSet<String> ALLOW_MERGE_AGGREGATE_FUNCTIONS =
+            ImmutableSet.of(MIN, MAX, SUM, COUNT);
+
+        public static MVAnalysis instance = new MVAnalysis();
+
+        private void check1(LogicalFileScan fileScan, LogicalProject<? extends Plan> project) {
+            PaimonExternalTable paimonExternalTable = (PaimonExternalTable) fileScan.getTable();
+
+            Table paimonTable = paimonExternalTable.getPaimonTable(Optional.empty());
+            Set<String> primaryKeys = new HashSet<>(paimonTable.primaryKeys());
+            List<Slot> projectInputSlots = project.getProjects().stream().map(NamedExpression::getInputSlots)
+                .flatMap(Collection::stream).collect(Collectors.toList());
+            Set<String> projectInputSlotNames = projectInputSlots.stream().map(NamedExpression::getName)
+                .collect(Collectors.toSet());
+
+            CoreOptions coreOptions = new CoreOptions(paimonTable.options());
+
+            Set<NamedExpression> primaryKeySlots = new HashSet<>();
+            Map<ExprId, String> exprIdToAggFunctionName = new HashMap<>();
+            List<Slot> fileScanOutputs = fileScan.getOutput();
+            for (Slot slot : fileScanOutputs) {
+                String fieldName = slot.getName();
+                if (primaryKeys.contains(fieldName)) {
+                    primaryKeySlots.add(slot);
+                    continue;
+                }
+
+                if (!projectInputSlotNames.contains(fieldName)) {
+                    continue;
+                }
+
+                String strAggFunc = coreOptions.fieldAggFunc(fieldName);
+                if (strAggFunc == null || strAggFunc.trim().isEmpty()) {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: column %s is not a aggregate column!",
+                        fieldName);
+                    throw new RuntimeException(errorMsg);
+                }
+
+                switch (strAggFunc) {
+                    case SUM:
+                        exprIdToAggFunctionName.put(slot.getExprId(), SUM);
+                        break;
+                    case MAX:
+                        exprIdToAggFunctionName.put(slot.getExprId(), MAX);
+                        break;
+                    case MIN:
+                        exprIdToAggFunctionName.put(slot.getExprId(), MIN);
+                        break;
+                    case COUNT:
+                        exprIdToAggFunctionName.put(slot.getExprId(), COUNT);
+                        break;
+                    default:
+                        String errorMsg = String.format(
+                            "paimon merge on doris failed: Use unsupported aggregation: %s",
+                            strAggFunc);
+                        throw new RuntimeException(errorMsg);
+                }
+            }
+        }
+
+        public PaimonMVAggInfo checkAndGetAggInfo(Plan plan) {
+            if (plan instanceof LogicalResultSink) {
+                plan = plan.child(0);
+            }
+            boolean isAggMode = logicalAggregate(logicalProject(logicalFilter(logicalFileScan())))
+                    .getPattern().matchPlanTree(plan);
+            if (!isAggMode) {
+                throw new RuntimeException("mv query must be agg mode: " + plan);
+            }
+            LogicalAggregate<? extends Plan> aggregate = (LogicalAggregate) plan;
+            LogicalProject<? extends Plan> lowerProject = (LogicalProject) plan.child(0);
+            LogicalFileScan fileScan = (LogicalFileScan) lowerProject.child(0).child(0);
+
+            if (!(fileScan.getTable() instanceof PaimonExternalTable)) {
+                throw new RuntimeException("table " + fileScan.getTable() + " not support incremental mv");
+            }
+
+            lowerProject.getProjects().forEach(e -> {
+                if (e instanceof Alias) {
+                    Alias alias = (Alias) e;
+                    if (alias.isNameFromChild()) {
+                        throw new RuntimeException("complex expression must has alias: " + e);
+                    }
+                }
+            });
+
+            aggregate.getOutputExpressions().forEach(e -> {
+                if (e instanceof Alias) {
+                    Alias alias = (Alias) e;
+                    if (alias.isNameFromChild()) {
+                        throw new RuntimeException("complex expression must has alias: " + e);
+                    }
+                }
+            });
+
+//            upperProject.getProjects().forEach(e -> {
+//                if (!(e instanceof SlotReference)) {
+//                    throw new RuntimeException("mv query project must be slot reference: " + e);
+//                }
+//            });
+
+            PaimonExternalTable paimonExternalTable = (PaimonExternalTable) fileScan.getTable();
+
+            Table paimonTable = paimonExternalTable.getPaimonTable(Optional.empty());
+            Set<String> primaryKeys = new HashSet<>(paimonTable.primaryKeys());
+            List<Slot> projectInputSlots = lowerProject.getProjects().stream().map(NamedExpression::getInputSlots)
+                .flatMap(Collection::stream).collect(Collectors.toList());
+
+            CoreOptions coreOptions = new CoreOptions(paimonTable.options());
+
+            Set<NamedExpression> primaryKeySlots = new HashSet<>();
+            Map<ExprId, String> exprIdToAggFunctionName = new HashMap<>();
+            List<Slot> fileScanOutputs = fileScan.getOutput();
+            for (Slot slot : fileScanOutputs) {
+                String fieldName = slot.getName();
+                if (primaryKeys.contains(fieldName)) {
+                    primaryKeySlots.add(slot);
+                    continue;
+                }
+
+                if (!projectInputSlots.contains(slot)) {
+                    continue;
+                }
+
+                String strAggFunc = coreOptions.fieldAggFunc(fieldName);
+                if (strAggFunc == null || strAggFunc.trim().isEmpty()) {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: column %s is not a aggregate column!",
+                        fieldName);
+                    throw new RuntimeException(errorMsg);
+                }
+
+                switch (strAggFunc) {
+                    case SUM:
+                        exprIdToAggFunctionName.put(slot.getExprId(), SUM);
+                        break;
+                    case MAX:
+                        exprIdToAggFunctionName.put(slot.getExprId(), MAX);
+                        break;
+                    case MIN:
+                        exprIdToAggFunctionName.put(slot.getExprId(), MIN);
+                        break;
+                    case COUNT:
+                        exprIdToAggFunctionName.put(slot.getExprId(), COUNT);
+                        break;
+                    default:
+                        String errorMsg = String.format(
+                            "paimon merge on doris failed: Use unsupported aggregation: %s",
+                            strAggFunc);
+                        throw new RuntimeException(errorMsg);
+                }
+            }
+
+//            if (logicalFilterOpt.isPresent()) {
+//                LogicalFilter<LogicalFileScan> logicalFilter = logicalFilterOpt.get();
+//                Set<String> nonPrimaryKeyFilterColumns = logicalFilter.getConjuncts().stream()
+//                    .map(Expression::getInputSlots)
+//                    .flatMap(Collection::stream).filter(e -> !primaryKeySlots.contains(e))
+//                    .map(NamedExpression::getName).collect(Collectors.toSet());
+//                if (!nonPrimaryKeyFilterColumns.isEmpty()) {
+//                    String errorMsg = String.format(
+//                        "paimon merge on doris failed: exist non-primary key filter: %s",
+//                        nonPrimaryKeyFilterColumns);
+//                    interruptIfEnable(sessionVariable, errorMsg);
+//                    return aggregate;
+//                }
+//            }
+//
+            Set<Slot> replacedGroupBySlots = PlanUtils.replaceExpressionByProjections(
+                    lowerProject.getProjects(), new ArrayList<>(aggregate.getGroupByExpressions()))
+                    .stream().map(Expression::getInputSlots).flatMap(Collection::stream)
+                    .collect(Collectors.toSet());
+
+            if (!new HashSet<>(primaryKeySlots).containsAll(replacedGroupBySlots)) {
+                replacedGroupBySlots.removeAll(primaryKeySlots);
+                String errorMsg = String.format(
+                    "paimon merge on doris failed: exist non-primary key group columns: %s",
+                    replacedGroupBySlots);
+                throw new RuntimeException(errorMsg);
+            }
+
+            List<Expression> replacedAggFunctions = PlanUtils.replaceExpressionByProjections(
+                lowerProject.getProjects(), new ArrayList<>(aggregate.getOutputExpressions()));
+
+//            replacedAggFunctions.forEach(e -> {
+//                if (!(e instanceof SlotReference)) {
+//                    throw new RuntimeException("mv query project must be slot reference: " + e);
+//                }
+//            });
+
+            PaimonMVAggInfo paimonMVAggInfo = new PaimonMVAggInfo();
+            for (Expression e : replacedAggFunctions) {
+                if (!(e instanceof Alias) || !(e.child(0) instanceof AggregateFunction)) {
+                    continue;
+                }
+                Alias alias = (Alias) e;
+                AggregateFunction aggFunc = (AggregateFunction) alias.child(0);
+                if (!(ALLOW_MERGE_AGGREGATE_FUNCTIONS.contains(aggFunc.getName()))) {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: Use unsupported aggregation: %s",
+                        aggFunc.getName());
+                    throw new RuntimeException(errorMsg);
+                }
+                if (aggFunc.isDistinct()) {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: %s Use distinct",
+                        aggFunc);
+                    throw new RuntimeException(errorMsg);
+                }
+                // not support outerAggFunc: sum(a+1),sum(a+b)
+                if (!(aggFunc.child(0) instanceof SlotReference)) {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: %s child is a complex expression",
+                        aggFunc);
+                    throw new RuntimeException(errorMsg);
+                }
+                ExprId childExprId = ((SlotReference) aggFunc.child(0)).getExprId();
+                if (exprIdToAggFunctionName.containsKey(childExprId)) {
+                    String aggFunctionName = exprIdToAggFunctionName.get(childExprId);
+                    if (!aggFunctionName.equals(aggFunc.getName())) {
+                        String errorMsg = String.format(
+                            "paimon merge on doris failed: sql agg function %s "
+                                + "is different from paimon agg function %s",
+                            aggFunc, aggFunctionName);
+                        throw new RuntimeException(errorMsg);
+                    }
+                } else {
+                    String errorMsg = String.format(
+                        "paimon merge on doris failed: Unable to find a reasonable "
+                            + "aggregation function for %s from paimon agg function",
+                        aggFunc);
+                    throw new RuntimeException(errorMsg);
+                }
+                paimonMVAggInfo.aggFunctions.put(alias.getName(), aggFunc.getName());
+            }
+
+            aggregate.getGroupByExpressions().forEach(slot -> paimonMVAggInfo.keys.add(((SlotReference) slot).getName()));
+            return paimonMVAggInfo;
+        }
+
+        @Override
+        public RulePromise defaultPromise() {
+            return RulePromise.ANALYSIS;
+        }
+    }
+
+    public static PaimonMVAggInfo checkPaimonIncrementalMV(Plan plan) {
+        return MVAnalysis.instance.checkAndGetAggInfo(plan);
+    }
 
     /**
      * Get related base table info which materialized view plan column reference,

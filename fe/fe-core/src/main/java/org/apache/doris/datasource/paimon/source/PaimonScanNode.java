@@ -287,6 +287,21 @@ public class PaimonScanNode extends FileQueryScanNode {
                 DataSplit dataSplit = (DataSplit) split;
                 BinaryRow partitionValue = dataSplit.partition();
                 selectedPartitionValues.add(partitionValue);
+
+//                DataSplit.Builder builder = DataSplit.builder()
+//                    .withSnapshot(dataSplit.snapshotId())
+//                    .withPartition(dataSplit.partition())
+//                    .withBucket(dataSplit.bucket())
+//                    .withBucketPath(dataSplit.bucketPath())
+//                    .withBeforeFiles(dataSplit.beforeFiles())
+//                    .withDataFiles(dataSplit.dataFiles())
+//                    .isStreaming(dataSplit.isStreaming())
+//                    .rawConvertible(true);
+//                dataSplit.beforeDeletionFiles().ifPresent(builder::withBeforeDeletionFiles);
+//                dataSplit.deletionFiles().ifPresent(builder::withDataDeletionFiles);
+//                dataSplit = builder.build();
+
+
                 Optional<List<RawFile>> optRawFiles = dataSplit.convertToRawFiles();
                 Optional<List<DeletionFile>> optDeletionFiles = dataSplit.deletionFiles();
 
@@ -373,7 +388,10 @@ public class PaimonScanNode extends FileQueryScanNode {
 
     public Map<String, String> getIncrReadParams() {
         Map<String, String> paimonScanParams = new HashMap<>();
-        if (scanParams != null && scanParams.incrementalRead()) {
+        if (scanParams == null) {
+            return paimonScanParams;
+        }
+        if (scanParams.incrementalRead()) {
             paimonScanParams.put(SCAN_SNAPSHOT_ID, null);
             paimonScanParams.put(SCAN_MODE, null);
 
@@ -417,6 +435,10 @@ public class PaimonScanNode extends FileQueryScanNode {
             } else {
                 throw new RuntimeException("Invalid paimon incr params: " + scanParams.getMapParams());
             }
+        } else if (scanParams.snapshotRead()) {
+            String snapshotId = scanParams.getMapParams().get("snapshotId");
+            paimonScanParams.put(SCAN_SNAPSHOT_ID, snapshotId);
+            paimonScanParams.put(SCAN_MODE, "from-snapshot");
         }
         return paimonScanParams;
     }
@@ -489,6 +511,7 @@ public class PaimonScanNode extends FileQueryScanNode {
                 map.put(k, v);
             }
         });
+//        map.put("dfs.client.socket-timeout", "1");
         return map;
     }
 

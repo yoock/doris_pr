@@ -137,6 +137,13 @@ public class UnboundRelation extends LogicalRelation implements Unbound, BlockFu
         return UnboundLogicalProperties.INSTANCE;
     }
 
+    public UnboundRelation withScanParams(TableScanParams scanParams) {
+        return new UnboundRelation(relationId, nameParts,
+                groupExpression, Optional.of(getLogicalProperties()),
+                partNames, isTempPart, tabletIds, hints, tableSample,
+                indexName, scanParams, indexInSqlString, tableSnapshot);
+    }
+
     @Override
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
         return new UnboundRelation(relationId, nameParts,

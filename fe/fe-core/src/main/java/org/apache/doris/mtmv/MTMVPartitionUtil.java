@@ -526,24 +526,38 @@ public class MTMVPartitionUtil {
      * @throws AnalysisException
      */
     public static Map<String, MTMVRefreshPartitionSnapshot> generatePartitionSnapshots(MTMVRefreshContext context,
-            Set<BaseTableInfo> baseTables, Set<String> partitionNames)
+            Set<BaseTableInfo> baseTables, Set<String> partitionNames, boolean incremental)
             throws AnalysisException {
         Map<String, MTMVRefreshPartitionSnapshot> res = Maps.newHashMap();
         for (String partitionName : partitionNames) {
             res.put(partitionName,
                     generatePartitionSnapshot(context, baseTables,
-                            context.getPartitionMappings().get(partitionName)));
+                            context.getPartitionMappings().get(partitionName), incremental));
         }
         return res;
     }
 
+    public static MTMVRefreshPartitionSnapshot generateSnapshot(MTMVRefreshContext context,
+            Set<BaseTableInfo> baseTables)
+            throws AnalysisException {
+        MTMVRefreshPartitionSnapshot refreshPartitionSnapshot = new MTMVRefreshPartitionSnapshot();
+        for (BaseTableInfo baseTableInfo : baseTables) {
+            TableIf table = MTMVUtil.getTable(baseTableInfo);
+            if (!(table instanceof MTMVRelatedTableIf)) {
+                continue;
+            }
+            refreshPartitionSnapshot.addTableSnapshot(baseTableInfo,
+                    getTableSnapshotFromContext((MTMVRelatedTableIf) table, context));
+        }
+        return refreshPartitionSnapshot;
+    }
 
     private static MTMVRefreshPartitionSnapshot generatePartitionSnapshot(MTMVRefreshContext context,
-            Set<BaseTableInfo> baseTables, Set<String> relatedPartitionNames)
+            Set<BaseTableInfo> baseTables, Set<String> relatedPartitionNames, boolean incremental)
             throws AnalysisException {
         MTMV mtmv = context.getMtmv();
         MTMVRefreshPartitionSnapshot refreshPartitionSnapshot = new MTMVRefreshPartitionSnapshot();
-        if (mtmv.getMvPartitionInfo().getPartitionType() != MTMVPartitionType.SELF_MANAGE) {
+        if (mtmv.getMvPartitionInfo().getPartitionType() != MTMVPartitionType.SELF_MANAGE && !incremental) {
             MTMVRelatedTableIf relatedTable = mtmv.getMvPartitionInfo().getRelatedTable();
             for (String relatedPartitionName : relatedPartitionNames) {
                 MTMVSnapshotIf partitionSnapshot = relatedTable.getPartitionSnapshot(relatedPartitionName, context,
@@ -553,7 +567,7 @@ public class MTMVPartitionUtil {
         }
         for (BaseTableInfo baseTableInfo : baseTables) {
             if (mtmv.getMvPartitionInfo().getPartitionType() != MTMVPartitionType.SELF_MANAGE && mtmv
-                    .getMvPartitionInfo().getRelatedTableInfo().equals(baseTableInfo)) {
+                    .getMvPartitionInfo().getRelatedTableInfo().equals(baseTableInfo) && !incremental) {
                 continue;
             }
             TableIf table = MTMVUtil.getTable(baseTableInfo);
